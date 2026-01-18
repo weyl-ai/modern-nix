@@ -2,6 +2,7 @@
 #include "nix/expr/eval-inline.hh"
 
 #include <wasmtime.hh>
+#include <wasi.h>
 
 using namespace wasmtime;
 
@@ -52,53 +53,32 @@ static std::span<T> subspan(std::span<uint8_t> s, size_t len)
     return std::span((T *) s.data(), len);
 }
 
-// FIXME: move to wasmtime C++ wrapper.
-class InstancePre
-{
-    WASMTIME_OWN_WRAPPER(InstancePre, wasmtime_instance_pre);
+struct NixWasmInstance;
 
-public:
-    TrapResult<Instance> instantiate(wasmtime::Store::Context cx)
-    {
-        wasmtime_instance_t instance;
-        wasm_trap_t * trap = nullptr;
-        auto * error = wasmtime_instance_pre_instantiate(ptr.get(), cx.capi(), &instance, &trap);
-        if (error != nullptr) {
-            return TrapError(wasmtime::Error(error));
-        }
-        if (trap != nullptr) {
-            return TrapError(Trap(trap));
-        }
-        return Instance(instance);
-    }
-};
-
-TrapResult<InstancePre> instantiate_pre(Linker & linker, const Module & m)
+template<typename R, typename... Args>
+static void regFun(Linker & linker, std::string_view name, R (NixWasmInstance::*f)(Args...))
 {
-    wasmtime_instance_pre_t * instance_pre;
-    auto * error = wasmtime_linker_instantiate_pre(linker.capi(), m.capi(), &instance_pre);
-    if (error != nullptr) {
-        return TrapError(wasmtime::Error(error));
-    }
-    return InstancePre(instance_pre);
+    unwrap(linker.func_wrap("env", name, [f](Caller caller, Args... args) -> Result<R, Trap> {
+        try {
+            auto instance = std::any_cast<NixWasmInstance *>(caller.context().get_data());
+            return (*instance.*f)(args...);
+        } catch (Error & e) {
+            return Trap(e.what());
+        }
+    }));
 }
 
-void regFuns(Linker & linker);
-
-struct NixWasmInstancePre
+// Pre-compiled module with linker (no WASI yet - that's per-instance)
+struct NixWasmModule
 {
     Engine & engine;
     SourcePath wasmPath;
-    InstancePre instancePre;
+    Module module;
 
-    NixWasmInstancePre(SourcePath _wasmPath)
+    NixWasmModule(SourcePath _wasmPath)
         : engine(getEngine())
         , wasmPath(_wasmPath)
-        , instancePre(({
-            Linker linker(engine);
-            regFuns(linker);
-            unwrap(instantiate_pre(linker, unwrap(Module::compile(engine, string2span(wasmPath.readFile())))));
-        }))
+        , module(unwrap(Module::compile(engine, string2span(wasmPath.readFile()))))
     {
     }
 };
@@ -106,26 +86,70 @@ struct NixWasmInstancePre
 struct NixWasmInstance
 {
     EvalState & state;
-    ref<NixWasmInstancePre> pre;
+    ref<NixWasmModule> mod;
     wasmtime::Store wasmStore;
     wasmtime::Store::Context wasmCtx;
-    Instance instance;
-    Memory memory_;
+    std::optional<Instance> instance;
+    std::optional<Memory> memory_;
 
     ValueVector values;
     std::exception_ptr ex;
 
     std::optional<std::string> functionName;
 
-    NixWasmInstance(EvalState & _state, ref<NixWasmInstancePre> _pre)
+    NixWasmInstance(EvalState & _state, ref<NixWasmModule> _mod)
         : state(_state)
-        , pre(_pre)
-        , wasmStore(pre->engine)
+        , mod(_mod)
+        , wasmStore(mod->engine)
         , wasmCtx(wasmStore)
-        , instance(unwrap(pre->instancePre.instantiate(wasmCtx)))
-        , memory_(std::get<Memory>(*instance.get(wasmCtx, "memory")))
     {
+        // Set instance pointer BEFORE instantiation so FFI callbacks can find us
         wasmCtx.set_data(this);
+
+        // Create linker for this instance
+        Linker linker(mod->engine);
+
+        // Set up WASI for GHC runtime support
+        wasi_config_t * wasi_config = wasi_config_new();
+        wasi_config_inherit_stdout(wasi_config);
+        wasi_config_inherit_stderr(wasi_config);
+
+        auto * error = wasmtime_context_set_wasi(wasmCtx.capi(), wasi_config);
+        if (error != nullptr) {
+            auto msg = wasmtime::Error(error);
+            throw nix::Error("failed to set WASI config: %s", msg.message());
+        }
+
+        // Link WASI functions
+        error = wasmtime_linker_define_wasi(linker.capi());
+        if (error != nullptr) {
+            auto msg = wasmtime::Error(error);
+            throw nix::Error("failed to define WASI: %s", msg.message());
+        }
+
+        // Register Nix FFI functions
+        regFun(linker, "panic", &NixWasmInstance::panic);
+        regFun(linker, "warn", &NixWasmInstance::warn);
+        regFun(linker, "get_type", &NixWasmInstance::get_type);
+        regFun(linker, "make_int", &NixWasmInstance::make_int);
+        regFun(linker, "get_int", &NixWasmInstance::get_int);
+        regFun(linker, "make_float", &NixWasmInstance::make_float);
+        regFun(linker, "get_float", &NixWasmInstance::get_float);
+        regFun(linker, "make_string", &NixWasmInstance::make_string);
+        regFun(linker, "copy_string", &NixWasmInstance::copy_string);
+        regFun(linker, "make_bool", &NixWasmInstance::make_bool);
+        regFun(linker, "get_bool", &NixWasmInstance::get_bool);
+        regFun(linker, "make_null", &NixWasmInstance::make_null);
+        regFun(linker, "make_list", &NixWasmInstance::make_list);
+        regFun(linker, "copy_list", &NixWasmInstance::copy_list);
+        regFun(linker, "make_attrset", &NixWasmInstance::make_attrset);
+        regFun(linker, "copy_attrset", &NixWasmInstance::copy_attrset);
+        regFun(linker, "copy_attrname", &NixWasmInstance::copy_attrname);
+        regFun(linker, "call_function", &NixWasmInstance::call_function);
+
+        // Instantiate the module (this may call _initialize which needs FFI)
+        instance = unwrap(linker.instantiate(wasmCtx, mod->module));
+        memory_ = std::get<Memory>(*instance->get(wasmCtx, "memory"));
     }
 
     ValueId addValue(Value * v)
@@ -144,12 +168,12 @@ struct NixWasmInstance
 
     Func getFunction(std::string_view name)
     {
-        auto ext = instance.get(wasmCtx, name);
+        auto ext = instance->get(wasmCtx, name);
         if (!ext)
-            throw Error("WASM module '%s' does not export function '%s'", pre->wasmPath, name);
+            throw Error("WASM module '%s' does not export function '%s'", mod->wasmPath, name);
         auto fun = std::get_if<Func>(&*ext);
         if (!fun)
-            throw Error("export '%s' of WASM module '%s' is not a function", name, pre->wasmPath);
+            throw Error("export '%s' of WASM module '%s' is not a function", name, mod->wasmPath);
         return *fun;
     }
 
@@ -161,7 +185,7 @@ struct NixWasmInstance
 
     auto memory()
     {
-        return memory_.data(wasmCtx);
+        return memory_->data(wasmCtx);
     }
 
     std::monostate panic(uint32_t ptr, uint32_t len)
@@ -173,7 +197,7 @@ struct NixWasmInstance
     {
         nix::warn(
             "'%s' function '%s': %s",
-            pre->wasmPath,
+            mod->wasmPath,
             functionName.value_or("<unknown>"),
             span2string(memory().subspan(ptr, len)));
         return {};
@@ -366,41 +390,6 @@ struct NixWasmInstance
     }
 };
 
-template<typename R, typename... Args>
-static void regFun(Linker & linker, std::string_view name, R (NixWasmInstance::*f)(Args...))
-{
-    unwrap(linker.func_wrap("env", name, [f](Caller caller, Args... args) -> Result<R, Trap> {
-        try {
-            auto instance = std::any_cast<NixWasmInstance *>(caller.context().get_data());
-            return (*instance.*f)(args...);
-        } catch (Error & e) {
-            return Trap(e.what());
-        }
-    }));
-}
-
-void regFuns(Linker & linker)
-{
-    regFun(linker, "panic", &NixWasmInstance::panic);
-    regFun(linker, "warn", &NixWasmInstance::warn);
-    regFun(linker, "get_type", &NixWasmInstance::get_type);
-    regFun(linker, "make_int", &NixWasmInstance::make_int);
-    regFun(linker, "get_int", &NixWasmInstance::get_int);
-    regFun(linker, "make_float", &NixWasmInstance::make_float);
-    regFun(linker, "get_float", &NixWasmInstance::get_float);
-    regFun(linker, "make_string", &NixWasmInstance::make_string);
-    regFun(linker, "copy_string", &NixWasmInstance::copy_string);
-    regFun(linker, "make_bool", &NixWasmInstance::make_bool);
-    regFun(linker, "get_bool", &NixWasmInstance::get_bool);
-    regFun(linker, "make_null", &NixWasmInstance::make_null);
-    regFun(linker, "make_list", &NixWasmInstance::make_list);
-    regFun(linker, "copy_list", &NixWasmInstance::copy_list);
-    regFun(linker, "make_attrset", &NixWasmInstance::make_attrset);
-    regFun(linker, "copy_attrset", &NixWasmInstance::copy_attrset);
-    regFun(linker, "copy_attrname", &NixWasmInstance::copy_attrname);
-    regFun(linker, "call_function", &NixWasmInstance::call_function);
-}
-
 void prim_wasm(EvalState & state, const PosIdx pos, Value ** args, Value & v)
 {
     auto wasmPath = realisePath(state, pos, *args[0]);
@@ -408,20 +397,39 @@ void prim_wasm(EvalState & state, const PosIdx pos, Value ** args, Value & v)
         std::string(state.forceStringNoCtx(*args[1], pos, "while evaluating the second argument of `builtins.wasm`"));
 
     try {
+        // Cache compiled modules (but not instances, since WASI state is per-instance)
         // FIXME: make thread-safe.
         // FIXME: make this a weak Boehm GC pointer so that it can be freed during GC.
-        static std::unordered_map<SourcePath, ref<NixWasmInstancePre>> instancesPre;
+        static std::unordered_map<SourcePath, ref<NixWasmModule>> modules;
 
-        auto instancePre = instancesPre.find(wasmPath);
-        if (instancePre == instancesPre.end())
-            instancePre = instancesPre.emplace(wasmPath, make_ref<NixWasmInstancePre>(wasmPath)).first;
+        auto mod = modules.find(wasmPath);
+        if (mod == modules.end())
+            mod = modules.emplace(wasmPath, make_ref<NixWasmModule>(wasmPath)).first;
 
         debug("calling wasm module");
 
-        NixWasmInstance instance{state, instancePre->second};
+        NixWasmInstance instance{state, mod->second};
 
-        // FIXME: use the "start" function if present.
+        // Initialize the WASM module (GHC RTS setup, etc.)
+        debug("calling _initialize");
+        auto initResult = instance.runFunction("_initialize", {});
+        debug("_initialize returned with %d results", initResult.size());
+        
+        // Check if hs_init is exported and call it (GHC WASM RTS init)
+        // hs_init(int *argc, char ***argv) - we pass NULL for both
+        auto hsInitExt = instance.instance->get(instance.wasmCtx, "hs_init");
+        if (hsInitExt) {
+            auto hsInit = std::get_if<Func>(&*hsInitExt);
+            if (hsInit) {
+                debug("calling hs_init");
+                unwrap(hsInit->call(instance.wasmCtx, {(int32_t) 0, (int32_t) 0}));
+                debug("hs_init complete");
+            }
+        }
+        
+        debug("calling nix_wasm_init_v1");
         instance.runFunction("nix_wasm_init_v1", {});
+        debug("initialization complete");
 
         v = *instance.values.at(instance.runFunction(functionName, {(int32_t) instance.addValue(args[2])}).at(0).i32());
     } catch (Error & e) {
@@ -434,8 +442,8 @@ static RegisterPrimOp primop_fromTOML(
     {.name = "wasm",
      .args = {"wasm", "entry", "arg"},
      .doc = R"(
-      Call a WASM function with the specified argument.
-     )",
+       Call a WASM function with the specified argument.
+      )",
      .fun = prim_wasm});
 
 } // namespace nix
