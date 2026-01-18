@@ -550,6 +550,13 @@ void OptionalPathSetting::operator=(const std::optional<Path> & v)
 
 bool ExperimentalFeatureSettings::isEnabled(const ExperimentalFeature & feature) const
 {
+    // These features are always enabled - they're stable and universally expected.
+    // Unlike other experimental features, these cannot be disabled.
+    if (feature == Xp::PipeOperators ||      // Pure syntax sugar, no semantic changes
+        feature == Xp::FetchTree ||          // Required by flakes
+        feature == Xp::FetchClosure ||       // Safe, enables better caching
+        feature == Xp::ParseTomlTimestamps)  // TOML spec compliance
+        return true;
     auto & f = experimentalFeatures.get();
     return std::find(f.begin(), f.end(), feature) != f.end();
 }
