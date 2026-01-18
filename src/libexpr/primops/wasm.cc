@@ -137,14 +137,22 @@ struct NixWasmInstance
         regFun(linker, "get_float", &NixWasmInstance::get_float);
         regFun(linker, "make_string", &NixWasmInstance::make_string);
         regFun(linker, "copy_string", &NixWasmInstance::copy_string);
+        regFun(linker, "get_string_len", &NixWasmInstance::get_string_len);
         regFun(linker, "make_bool", &NixWasmInstance::make_bool);
         regFun(linker, "get_bool", &NixWasmInstance::get_bool);
         regFun(linker, "make_null", &NixWasmInstance::make_null);
+        regFun(linker, "make_path", &NixWasmInstance::make_path);
+        regFun(linker, "copy_path", &NixWasmInstance::copy_path);
         regFun(linker, "make_list", &NixWasmInstance::make_list);
         regFun(linker, "copy_list", &NixWasmInstance::copy_list);
+        regFun(linker, "get_list_len", &NixWasmInstance::get_list_len);
+        regFun(linker, "get_list_elem", &NixWasmInstance::get_list_elem);
         regFun(linker, "make_attrset", &NixWasmInstance::make_attrset);
         regFun(linker, "copy_attrset", &NixWasmInstance::copy_attrset);
         regFun(linker, "copy_attrname", &NixWasmInstance::copy_attrname);
+        regFun(linker, "get_attrs_len", &NixWasmInstance::get_attrs_len);
+        regFun(linker, "has_attr", &NixWasmInstance::has_attr);
+        regFun(linker, "get_attr", &NixWasmInstance::get_attr);
         regFun(linker, "call_function", &NixWasmInstance::call_function);
 
         // Instantiate the module (this may call _initialize which needs FFI)
@@ -387,6 +395,84 @@ struct NixWasmInstance
         state.callFunction(fun, args, value, noPos);
 
         return valueId;
+    }
+
+    // Get the length of a list without copying
+    uint32_t get_list_len(ValueId valueId)
+    {
+        auto & value = *values.at(valueId);
+        state.forceList(value, noPos, "while getting list length from WASM");
+        return value.listSize();
+    }
+
+    // Get a single list element by index
+    ValueId get_list_elem(ValueId valueId, uint32_t idx)
+    {
+        auto & value = *values.at(valueId);
+        state.forceList(value, noPos, "while getting list element from WASM");
+        if (idx >= value.listSize())
+            throw Error("list index %d out of bounds (size %d)", idx, value.listSize());
+        auto view = value.listView();
+        return addValue(view[idx]);
+    }
+
+    // Get the number of attributes in an attrset without copying
+    uint32_t get_attrs_len(ValueId valueId)
+    {
+        auto & value = *values.at(valueId);
+        state.forceAttrs(value, noPos, "while getting attrset size from WASM");
+        return value.attrs()->size();
+    }
+
+    // Check if an attribute exists in an attrset
+    int32_t has_attr(ValueId valueId, uint32_t namePtr, uint32_t nameLen)
+    {
+        auto & value = *values.at(valueId);
+        state.forceAttrs(value, noPos, "while checking attr in WASM");
+        auto name = state.symbols.create(span2string(memory().subspan(namePtr, nameLen)));
+        return value.attrs()->get(name) != nullptr ? 1 : 0;
+    }
+
+    // Get an attribute value by name, returns 0xFFFFFFFF if not found
+    uint32_t get_attr(ValueId valueId, uint32_t namePtr, uint32_t nameLen)
+    {
+        auto & value = *values.at(valueId);
+        state.forceAttrs(value, noPos, "while getting attr from WASM");
+        auto name = state.symbols.create(span2string(memory().subspan(namePtr, nameLen)));
+        auto attr = value.attrs()->get(name);
+        if (!attr)
+            return 0xFFFFFFFF; // sentinel for "not found"
+        return addValue(attr->value);
+    }
+
+    // Create a path value from a string
+    ValueId make_path(uint32_t ptr, uint32_t len)
+    {
+        auto [valueId, value] = allocValue();
+        auto pathStr = span2string(memory().subspan(ptr, len));
+        value.mkPath(state.rootPath(CanonPath(pathStr)), state.mem);
+        return valueId;
+    }
+
+    // Copy a path value to a buffer (returns length, copies up to maxLen bytes)
+    uint32_t copy_path(ValueId valueId, uint32_t ptr, uint32_t maxLen)
+    {
+        auto & value = *values.at(valueId);
+        NixStringContext context;
+        auto path = state.coerceToPath(noPos, value, context, "while copying path from WASM");
+        auto pathStr = path.path.abs();
+        if (pathStr.size() <= maxLen) {
+            auto buf = memory().subspan(ptr, maxLen);
+            memcpy(buf.data(), pathStr.data(), pathStr.size());
+        }
+        return pathStr.size();
+    }
+
+    // Get string length without copying
+    uint32_t get_string_len(ValueId valueId)
+    {
+        auto s = state.forceString(*values.at(valueId), noPos, "while getting string length from WASM");
+        return s.size();
     }
 };
 
