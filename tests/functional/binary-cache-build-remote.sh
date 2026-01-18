@@ -2,6 +2,10 @@
 
 source common.sh
 
+# Remote builders are disabled in this fork - the build hook has unsound
+# pipe/fd handling that causes log streaming bugs with CA derivations.
+skipTest "remote builders disabled - build hook is unsound"
+
 TODO_NixOS
 
 clearStoreIfPossible

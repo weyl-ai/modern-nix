@@ -273,17 +273,18 @@ public:
 
     Setting<Strings> buildHook{
         this,
-        {"nix", "__build-remote"},
+        {}, // Remote builders disabled - the build hook implementation is unsound
         "build-hook",
         R"(
           The path to the helper program that executes remote builds.
 
           Nix communicates with the build hook over `stdio` using a custom protocol to request builds that cannot be performed directly by the Nix daemon.
-          The default value is the internal Nix binary that implements remote building.
 
-          > **Important**
+          > **Warning**
           >
-          > Change this setting only if you really know what you’re doing.
+          > Remote builders are disabled by default in this fork due to bugs in
+          > log streaming that interact poorly with content-addressed derivations.
+          > Set to `nix __build-remote` to re-enable at your own risk.
         )"};
 
     Setting<std::string> builders{
