@@ -552,7 +552,8 @@ bool ExperimentalFeatureSettings::isEnabled(const ExperimentalFeature & feature)
 {
     // These features are always enabled - they're stable and universally expected.
     // Unlike other experimental features, these cannot be disabled.
-    if (feature == Xp::PipeOperators ||      // Pure syntax sugar, no semantic changes
+    if (feature == Xp::CaDerivations ||      // Content-addressed derivations - foundation for reproducible builds
+        feature == Xp::PipeOperators ||      // Pure syntax sugar, no semantic changes
         feature == Xp::FetchTree ||          // Required by flakes
         feature == Xp::FetchClosure ||       // Safe, enables better caching
         feature == Xp::ParseTomlTimestamps)  // TOML spec compliance

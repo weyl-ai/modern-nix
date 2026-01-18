@@ -1135,9 +1135,12 @@ DerivationBuildingGoal::checkPathValidity(std::map<std::string, InitialOutput> &
         auto drvOutput = DrvOutput{info.outputHash, i.first};
         if (experimentalFeatureSettings.isEnabled(Xp::CaDerivations)) {
             if (auto real = worker.store.queryRealisation(drvOutput)) {
+                auto outputPath = real->outPath;
                 info.known = {
-                    .path = real->outPath,
-                    .status = PathStatus::Valid,
+                    .path = outputPath,
+                    .status = !worker.store.isValidPath(outputPath)               ? PathStatus::Absent
+                              : !checkHash || worker.pathContentsGood(outputPath) ? PathStatus::Valid
+                                                                                  : PathStatus::Corrupt,
                 };
             } else if (info.known && info.known->isValid()) {
                 // We know the output because it's a static output of the

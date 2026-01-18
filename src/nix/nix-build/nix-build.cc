@@ -597,6 +597,13 @@ static void main_nix_build(int argc, char ** argv)
             for (const auto & [inputDrv, inputNode] : drv.inputDrvs.map)
                 accumInputClosure(inputDrv, inputNode);
 
+            /* Also add paths from exportReferencesGraph to inputs, since
+               prepareStructuredAttrs will call exportReferences which requires
+               these paths to be in the input closure. */
+            for (const auto & [_, storePaths] : drvOptions.exportReferencesGraph)
+                for (const auto & p : storePaths)
+                    store->computeFSClosure(p, inputs);
+
             auto json = drv.structuredAttrs->prepareStructuredAttrs(*store, drvOptions, inputs, drv.outputs);
 
             structuredAttrsRC = StructuredAttrs::writeShell(json);
